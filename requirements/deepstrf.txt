@@ -1,0 +1,3 @@
+# Geprüfter Entwicklungsstand; keine automatische Migration auf spätere APIs.
+-r analysis.txt
+deepSTRF @ https://github.com/urancon/deepSTRF/archive/5dba99f60a5cb51548f9f9769941cca377771d01.zip

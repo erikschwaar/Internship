@@ -1,0 +1,14 @@
+﻿.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.idea/
+.obsidian/
+outputs/
+output/
+backups/
+data/raw/
+Autorendaten/
+*.mat
+*.wav
+*.pt
