@@ -46,12 +46,72 @@ def split_stimuli(identities, seed=42, categories=None):
                 validation=validation, test=order[:3])
 
 
-def build_model(name, dataset):
+class FixedBatchNorm1d(torch.nn.BatchNorm1d):
+    """Keep training-derived moments fixed in both train and evaluation modes.
+
+    Affine parameters remain learnable. State keys match native BatchNorm so
+    normalization mode must be restored from the run configuration.
+    """
+    def train(self, mode=True):
+        return super().train(False)
+
+
+def calibrate_linear_normalization(model, loader):
+    """Measure pre-normalization activations on observed training targets only."""
+    norm = model.readout.bn
+    if not isinstance(norm, FixedBatchNorm1d):
+        raise ValueError("Calibration requires fixed-training normalization")
+    total = torch.zeros(norm.num_features, dtype=torch.float64)
+    squares = torch.zeros_like(total)
+    counts = torch.zeros_like(total)
+    model.eval()
+    with torch.no_grad():
+        for batch in loader:
+            features = model.wav2spec(batch["stims"])
+            values = model.readout.strf(features).squeeze(2).double()
+            valid = torch.isfinite(batch["responses"]).any(dim=2)
+            if values.shape != valid.shape or not torch.isfinite(values).all():
+                raise ValueError("Invalid pre-normalization activations")
+            observed = torch.where(valid, values, 0)
+            total += observed.sum(dim=(0, 2))
+            squares += observed.square().sum(dim=(0, 2))
+            counts += valid.sum(dim=(0, 2))
+    if (counts == 0).any():
+        raise ValueError("Every ROI needs training observations for normalization")
+    mean = total / counts
+    variance = (squares / counts - mean.square()).clamp_min(0)
+    norm.running_mean.copy_(mean.float())
+    norm.running_var.copy_(variance.float())
+    norm.num_batches_tracked.zero_()
+    return dict(source="observed training sound/time bins before fitting",
+                mean=mean.tolist(), variance=variance.tolist(), count=counts.long().tolist())
+
+
+def initialize_linear_from_baseline(model, location, scale):
+    """Start at the training-only constant with learnable sound-dependent weights."""
+    norm = model.readout.bn
+    if not isinstance(norm, FixedBatchNorm1d):
+        raise ValueError("Baseline initialization requires fixed-training normalization")
+    with torch.no_grad():
+        for parameter in model.readout.strf.parameters():
+            parameter.zero_()
+        norm.weight.copy_(torch.as_tensor(scale, dtype=norm.weight.dtype))
+        # Compensate for the fixed centering so zero filters predict location.
+        offset = norm.weight * norm.running_mean / torch.sqrt(norm.running_var + norm.eps)
+        norm.bias.copy_(torch.as_tensor(location, dtype=norm.bias.dtype) + offset)
+
+
+def build_model(name, dataset, *, normalization="running"):
     common = dict(n_frequency_bands=dataset.F, out_neurons=dataset.N_neurons,
                   output_activation=torch.nn.Identity())
     if name != "linear":
         raise ValueError(f"Only the linear model is supported, got: {name}")
     model = Linear(**common, temporal_window_size=16)
+    if normalization == "fixed-training":
+        model.readout.bn = FixedBatchNorm1d(dataset.N_neurons)
+        model.readout.bn.eval()
+    elif normalization != "running":
+        raise ValueError(f"Unknown normalization mode: {normalization}")
     model.wav2spec = dataset.make_wav2spec()
     model.validate()
     return model

@@ -109,7 +109,7 @@ shared sounds.
 The dataset stores time-aligned mono waveforms. `dataset.make_wav2spec()` creates
 deepSTRF's native `CausalMelSpectrogram`, which is attached to the model's
 `wav2spec` slot. The starting settings are 32 mel bands, a 32 ms window and hop,
-power spectra and log1p compression.
+power spectra and threshold-clipped log compression.
 
 ```python
 from bat_internship.training import build_model
@@ -170,8 +170,11 @@ All repeats and sites for a given sound stay in the same split. Three sounds are
 used for validation, three remain reserved for a future test, and the rest are
 used for training. Test sounds are not evaluated by this workflow.
 
-Output initialization and the constant per-ROI baseline use only observed
-training responses. Missing targets are excluded from loss and evaluation.
+The model starts at the constant per-ROI mean of observed training responses,
+with zero sound-dependent filter weights. Normalization moments are calibrated
+on training inputs and then held fixed during training and evaluation.
+The filters and affine parameters remain learnable. The constant comparison
+baseline also uses only observed training responses. Missing targets are excluded from loss and evaluation.
 Results include aggregate and per-site scores, prediction plots, checkpoints,
 sound assignments and ROI metadata. Each run gets its own directory under
 `outputs/linear_dataset_validation/`.
@@ -205,3 +208,5 @@ unverified locally because the memory check stopped it before loading.
 - [Training statistics and metrics](src/bat_internship/training.py)
 - [Multi-site tests](tests/test_bat_audio_multisite.py)
 - [Missing-value and training tests](tests/test_training.py)
+
+Frontend configuration update: new runs use `compression="log"` (floor `1e-4`). Existing runs produced with `log1p` retain their original configuration and results; retrain to evaluate the new frontend.

@@ -20,7 +20,11 @@ from bat_internship.bat_data import BatData
 from bat_internship.bat_audio_dataset import BatAudioDataset
 from bat_internship.paths import MAT_PATH, PROJECT_ROOT, OUTPUT_ROOT
 from bat_internship.site_selection import require_available_memory
-from bat_internship.training import split_stimuli, build_model, comparison_scores, CheckpointPath, training_response_statistics
+from bat_internship.training import (
+    split_stimuli, build_model, comparison_scores, CheckpointPath,
+    training_response_statistics, calibrate_linear_normalization,
+    initialize_linear_from_baseline,
+)
 
 
 def write_json(path, obj):
@@ -54,8 +58,9 @@ def main():
                         default="category-coverage")
     parser.add_argument("--output-root", type=Path, default=OUTPUT_ROOT / "linear_dataset_validation")
     parser.add_argument("--validation-only", action="store_true")
-    parser.add_argument("--linear-init", choices=["default", "train-statistics"],
-                        default="train-statistics")
+    parser.add_argument("--linear-init", choices=["default", "train-statistics", "baseline"],
+                        default="baseline")
+    parser.add_argument("--linear-normalization", choices=["running", "fixed-training"], default="fixed-training")
     parser.add_argument("--learning-rate", type=float, default=0.0003)
     parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args()
@@ -63,6 +68,8 @@ def main():
         parser.error("epochs and patience must be positive")
     if not math.isfinite(args.learning_rate) or args.learning_rate <= 0:
         parser.error("learning-rate must be finite and positive")
+    if args.linear_init == "baseline" and args.linear_normalization != "fixed-training":
+        parser.error("baseline initialization requires --linear-normalization fixed-training")
     torch.set_num_threads(2)
     torch.use_deterministic_algorithms(True)
     with BatData(MAT_PATH) as source:
@@ -100,7 +107,7 @@ def main():
                   optimizer="AdamW", learning_rate=args.learning_rate, weight_decay=0.0001,
                   monitor="val_loss", target="repeat mean of original fluorescence",
                   normalization="none", baseline_subtraction=False,
-                  linear_initialization=args.linear_init,
+                  linear_initialization=args.linear_init, linear_normalization=args.linear_normalization,
                   dt_ms=32, audio_offset_ms=0, n_mels=ds.F,
                   frontend=repr(ds.make_wav2spec()),
                   deepstrf_commit="5dba99f60a5cb51548f9f9769941cca377771d01",
@@ -124,8 +131,12 @@ def main():
                    shuffle=key=="train", num_workers=0, collate_fn=neural_collate,
                    generator=torch.Generator().manual_seed(args.seed))
                    for key,ids in splits.items() if key!="test" or evaluate_test}
-        model = build_model(name, ds)
-        if name == "linear" and args.linear_init == "train-statistics":
+        model = build_model(name, ds, normalization=args.linear_normalization)
+        train_evaluation_loader = DataLoader(
+            Subset(ds, splits["train"]), batch_size=2, shuffle=False,
+            num_workers=0, collate_fn=neural_collate,
+        )
+        if name == "linear" and args.linear_init in ("train-statistics", "baseline"):
             # Use only observed repeat means from training sounds.
             location_tensor = torch.from_numpy(location).float()
             scale_tensor = torch.from_numpy(scale).float()
@@ -140,6 +151,12 @@ def main():
                        dict(source="training sounds, repeat means",
                             indices=splits["train"], offset=location.tolist(),
                             scale=scale.tolist(), observed_bins_per_roi=training_counts.tolist()))
+        if args.linear_normalization == "fixed-training":
+            calibration = calibrate_linear_normalization(model, train_evaluation_loader)
+            calibration["indices"] = splits["train"]
+            write_json(out / "linear_normalization.json", calibration)
+        if args.linear_init == "baseline":
+            initialize_linear_from_baseline(model, location, scale)
         model_out = out / name
         model_out.mkdir()
         # Check real shapes, finite loss and gradients before fitting.
@@ -157,6 +174,12 @@ def main():
         model.zero_grad(set_to_none=True)
         del pred, loss, batch
         def log(row):
+            # Evaluate a fixed, non-shuffled training loader in inference mode.
+            # This separates generalization from train/eval normalization effects.
+            train_pred, train_target = predict(model, train_evaluation_loader)
+            train_baseline = np.broadcast_to(location[None, :, None], train_target.shape)
+            row["train_eval_mse"] = comparison_scores(
+                train_pred, train_target, train_baseline)["model"]["mean_mse"]
             if not all(np.isfinite(v) for v in row.values()):
                 raise ValueError(f"Nonfinite training history: {row}")
             with (model_out / "history.jsonl").open("a",encoding="utf-8") as f:
@@ -183,6 +206,7 @@ def main():
         result = dict(parameters=sum(p.numel() for p in model.parameters()),
                       epochs_completed=len(history),
                       best_validation_loss=min(row["val_loss"] for row in history),
+                      best_epoch=min(history, key=lambda row: row["val_loss"])["epoch"],
                       test_evaluated=evaluate_test)
         for subset in (["validation","test"] if evaluate_test else ["validation"]):
             pred, target = predict(model, loaders[subset])
@@ -207,8 +231,13 @@ def main():
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         fig, ax = plt.subplots(figsize=(7,4),layout="constrained")
-        for key in ["train_loss","val_loss"]:
-            ax.plot([r["epoch"] for r in history],[r[key] for r in history],label=key)
+        for key, label in [("train_loss", "Training batches"),
+                           ("train_eval_mse", "Training in evaluation mode"),
+                           ("val_loss", "Validation")]:
+            ax.plot([r["epoch"] for r in history], [r[key] for r in history], label=label)
+        ax.axhline(result["validation"]["constant_baseline"]["mean_mse"],
+                   color="gray", ls="--", label="Validation constant baseline")
+        ax.axvline(result["best_epoch"], color="gray", ls=":", label="Selected epoch")
         ax.set(xlabel="Epoch",ylabel="MSE",title=f"{name} / {len(sites)} site(s)")
         ax.legend(); fig.savefig(model_out/"learning_curve.png"); plt.close(fig)
         fig, axes = plt.subplots(3,1,figsize=(8,7),sharex=True,layout="constrained")

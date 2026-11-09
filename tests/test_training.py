@@ -6,7 +6,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 from bat_internship.training import split_stimuli, per_roi_scores, build_model, comparison_scores, training_response_statistics
 from deepSTRF.models.wav2spec import make_wav2spec
-from bat_internship.training import CheckpointPath
+from bat_internship.training import CheckpointPath, FixedBatchNorm1d, calibrate_linear_normalization, initialize_linear_from_baseline
 
 
 class TrainingTests(unittest.TestCase):
@@ -116,6 +116,57 @@ class TrainingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             training_response_statistics(Dataset(), [0])
 
+    def test_fixed_normalization_uses_observed_training_bins(self):
+        model = torch.nn.Module()
+        model.wav2spec = torch.nn.Identity()
+        model.readout = torch.nn.Module()
+        model.readout.strf = torch.nn.Identity()
+        model.readout.bn = FixedBatchNorm1d(2)
+        values = torch.tensor([[[[1., 2., 3.]], [[2., 4., 6.]]],
+                               [[[100., 200., 300.]], [[4., 6., 8.]]]])
+        responses = torch.ones(2, 2, 2, 3)
+        responses[1, 0] = float('nan')
+        responses[0, 1, 1] = float('nan')  # One padded repetition.
+        report = calibrate_linear_normalization(
+            model, [dict(stims=values, responses=responses)])
+        np.testing.assert_allclose(report['mean'], [2., 5.])
+        np.testing.assert_allclose(report['variance'], [2/3, 11/3])
+        self.assertEqual(report['count'], [3, 6])
+        model.train()
+        self.assertFalse(model.readout.bn.training)
+        norm = model.readout.bn
+        before = {key: value.clone() for key, value in norm.state_dict().items()}
+        x = values.squeeze(2)
+        train_prediction = norm(x)
+        norm.eval()
+        torch.testing.assert_close(norm(x), train_prediction)
+        for key, value in norm.state_dict().items():
+            torch.testing.assert_close(value, before[key])
+        train_prediction.square().mean().backward()
+        self.assertTrue(torch.isfinite(norm.weight.grad).all())
+        self.assertTrue(torch.isfinite(norm.bias.grad).all())
+        responses[:, 0] = float('nan')
+        with self.assertRaises(ValueError):
+            calibrate_linear_normalization(model, [dict(stims=values, responses=responses)])
+
+    def test_baseline_initialization_is_constant_with_live_filter_gradients(self):
+        class Dataset:
+            F = 2
+            N_neurons = 2
+            def make_wav2spec(self):
+                return torch.nn.Identity()
+        model = build_model('linear', Dataset(), normalization='fixed-training')
+        model.readout.bn.running_mean.copy_(torch.tensor([0.3, -0.2]))
+        model.readout.bn.running_var.copy_(torch.tensor([0.02, 0.04]))
+        initialize_linear_from_baseline(model, [1.1, 1.3], [0.1, 0.2])
+        model.train()
+        x = torch.randn(2, 1, 2, 20)
+        prediction = model(x)
+        expected = torch.tensor([1.1, 1.3])[None, :, None, None].expand_as(prediction)
+        torch.testing.assert_close(prediction, expected)
+        prediction.square().mean().backward()
+        self.assertTrue(any(p.grad.abs().sum() > 0 for p in model.readout.strf.parameters()))
+
     def test_linear_only(self):
         with self.assertRaises(ValueError):
             build_model('convnet2d', type('Dataset', (), dict(F=32, N_neurons=2))())
@@ -127,16 +178,17 @@ class TrainingTests(unittest.TestCase):
             def make_wav2spec(self):
                 return make_wav2spec('mel',audio_fs=8000,dt_ms=32,win_ms=32,
                                     n_mels=32,f_min=0,f_max=4000,
-                                    magnitude='power',compression='log1p')
+                                    magnitude='power',compression='log')
         torch.set_num_threads(2)
         x=torch.randn(2,1,51*256)
-        for name in ['linear']:
-            model=build_model(name,Dataset())
+        for normalization in ['running', 'fixed-training']:
+            name = 'linear'
+            model=build_model(name,Dataset(), normalization=normalization)
             out=model(x)
             self.assertEqual(tuple(out.shape),(2,3,1,51))
             out.square().mean().backward()
             self.assertTrue(all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None))
-            restored=build_model(name,Dataset())
+            restored=build_model(name,Dataset(), normalization=normalization)
             restored.load_state_dict(model.state_dict())
             model.eval(); restored.eval()
             with torch.no_grad():

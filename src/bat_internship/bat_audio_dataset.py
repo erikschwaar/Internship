@@ -179,12 +179,12 @@ class BatAudioDataset(AudioNeuralDataset):
     def make_wav2spec(self, **kwargs):
         """Build the official model front-end with matching audio rate and hop.
 
-        Default: 32-ms window/hop, power, log1p, 0..Nyquist, HTK Mel bands.
+        Default: 32-ms window/hop, power, threshold-clipped log, 0..Nyquist, HTK Mel bands.
         These are explicit starting parameters, not a bat hearing model.
         """
         from deepSTRF.models.wav2spec import make_wav2spec
         settings = dict(n_mels=self.F, win_ms=self.dt, f_min=0.0,
-                        f_max=self.audio_fs / 2, magnitude="power", compression="log1p")
+                        f_max=self.audio_fs / 2, magnitude="power", compression="log")
         settings.update(kwargs)
         if settings["n_mels"] != self.F:
             raise ValueError("Front-end n_mels must match dataset.F")

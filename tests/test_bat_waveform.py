@@ -2,8 +2,8 @@
 import unittest
 import numpy as np
 import torch
-from deepSTRF.models.wav2spec import make_wav2spec
-from bat_internship.bat_audio_dataset import align_waveform
+from bat_internship.bat_audio_dataset import align_waveform, BatAudioDataset
+from types import SimpleNamespace
 
 
 class WaveformTests(unittest.TestCase):
@@ -22,13 +22,16 @@ class WaveformTests(unittest.TestCase):
     def test_native_mel_onset_delay_and_no_future_leakage(self):
         fs = 200000
         x = np.sin(2*np.pi*40000*np.arange(6400)/fs)
-        frontend = make_wav2spec("mel", audio_fs=fs, dt_ms=32,
-            win_ms=32, n_mels=32, f_min=0, f_max=100000,
-            magnitude="power", compression="log1p")
+        dataset = SimpleNamespace(F=32, dt=32, audio_fs=fs)
+        frontend = BatAudioDataset.make_wav2spec(dataset)
         a = align_waveform(x, fs, [-32, 0, 32, 64])
         y = frontend(a[None])
         self.assertEqual(tuple(y.shape), (1,1,32,4))
-        torch.testing.assert_close(y[..., [0,1,3]], torch.zeros_like(y[..., [0,1,3]]))
+        self.assertTrue(torch.isfinite(y).all())
+        torch.testing.assert_close(y[..., [0,1,3]],
+                                  torch.full_like(y[..., [0,1,3]], np.log(1e-4)))
+        raw = BatAudioDataset.make_wav2spec(dataset, compression="none")(a[None])
+        torch.testing.assert_close(y, raw.clamp_min(1e-4).log())
         self.assertGreater(y[...,2].max(),0)
         delayed = align_waveform(x, fs, [-32,0,32,64], audio_offset_ms=32)
         torch.testing.assert_close(frontend(delayed[None])[...,3], y[...,2])
