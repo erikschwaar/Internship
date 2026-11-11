@@ -205,15 +205,14 @@ class BatAudioDataset(AudioNeuralDataset):
 
 
 def plot_audio_example(dataset, stimulus_index=10, roi_index=3):
-    """Show the original waveform, detailed WAV spectrum and calcium targets."""
+    """Show the original waveform, native model mel features and calcium targets."""
     import matplotlib.pyplot as plt
-    from matplotlib.colors import LinearSegmentedColormap
     if not 0 <= stimulus_index < len(dataset.stims) or not 0 <= roi_index < dataset.N_neurons:
         raise ValueError("Stimulus or ROI index out of bounds")
     meta = dataset.stim_meta[stimulus_index]
     if not torch.isfinite(dataset.responses[stimulus_index][roi_index]).any():
         raise ValueError("This ROI was not measured for the selected stimulus")
-    fig, axes = plt.subplots(3, 1, figsize=(12, 10), layout="constrained")
+    fig, axes = plt.subplots(3, 1, figsize=(8, 6.4), layout="constrained")
     offset_ms = meta["audio_offset_ms_assumed"]
     if hasattr(dataset, "waveforms"):
         waveform = dataset.waveforms[stimulus_index]
@@ -222,40 +221,43 @@ def plot_audio_example(dataset, stimulus_index=10, roi_index=3):
         waveform, _ = load_mapped_audio(row, meta["audio_root"], meta["category"])
     wav_time = np.arange(len(waveform)) * 1000 / dataset.audio_fs + offset_ms
     axes[0].plot(wav_time, waveform, lw=0.6, color="#365c7a")
-    axes[0].set(ylabel="Audio (PCM / 32768)", title="Original-WAV, ohne zeitliche Streckung")
-    # Fine-time display only: do not replace or relabel the 32-ms model features.
-    nfft = min(256, len(waveform))
-    spectrum_colors = LinearSegmentedColormap.from_list(
-        "blue_cyan_yellow", ["#352a87", "#1464ef", "#06b7d7", "#42bd71", "#bddf26", "#fff126"])
-    power, _, _, spectrum = axes[1].specgram(
-        waveform, NFFT=nfft, Fs=dataset.audio_fs, noverlap=3 * nfft // 4,
-        window=np.hanning(nfft), detrend="none", mode="psd", scale="dB",
-        cmap=spectrum_colors)
-    peak_db = 10 * np.log10(max(float(np.max(power)), np.finfo(float).tiny))
-    spectrum.set_clim(peak_db - 60, peak_db)
-    x0, x1, y0, y1 = spectrum.get_extent()
-    spectrum.set_extent((x0 * 1000 + offset_ms,
-                         x1 * 1000 + offset_ms, y0 / 1000, y1 / 1000))
-    duration_ms = len(waveform) / dataset.audio_fs * 1000
-    axes[1].set(ylabel="Frequency (kHz)", xlabel="Time (ms from assumed sound onset)",
-                ylim=(0, dataset.audio_fs / 2000),
-                title=f"WAV spectrogram: {nfft / dataset.audio_fs * 1000:g}-ms Hann window, 75% overlap; display only")
-    fig.colorbar(spectrum, ax=axes[1], label="PSD (dB re 1 PCM²/Hz)", pad=0.02)
-    for ax in axes[:2]:
-        ax.set_xlim(offset_ms, offset_ms + duration_ms)
+    axes[0].set(ylabel="Amplitude", title="A  Audio waveform")
     times = np.asarray(meta["time_ms_assumed"])
     dt = meta["dt_ms_assumed"]
+    duration_ms = len(waveform) / dataset.audio_fs * 1000
+    # Use exactly the dataset waveform and native frontend used by the model.
+    if dataset.return_waveform:
+        frontend = dataset.make_wav2spec()
+        with torch.no_grad():
+            mel = frontend(dataset.stims[stimulus_index].unsqueeze(0))[0, 0].cpu().numpy()
+    else:
+        mel = dataset.stims[stimulus_index][0].cpu().numpy()
+    spectrum = axes[1].imshow(
+        mel, origin="lower", aspect="auto", interpolation="nearest", cmap="viridis",
+        extent=(times[0] - dt, times[-1], -0.5, dataset.F - 0.5))
+    axes[1].set(ylabel="Mel band", xlabel="Time from sound onset (ms)",
+                title=f"B  deepSTRF mel spectrogram · {dt:g}-ms bins")
+    fig.colorbar(spectrum, ax=axes[1], label="Log mel power", pad=0.02)
+    axes[0].set_xlim(offset_ms, offset_ms + duration_ms)
+    axes[1].axvline(0, ls="--", color="white", lw=0.8)
     responses = dataset.responses[stimulus_index][roi_index].numpy()
     for i, response in enumerate(responses):
         axes[2].plot(times, response, color="#7898ae", alpha=0.45, lw=0.8,
-                     label="Einzelwiederholungen" if i == 0 else None)
-    axes[2].plot(times, responses.mean(axis=0), color="#192f40", lw=2, label="Mittelwert (nur Anzeige)")
+                     label="Trials" if i == 0 else None)
+    axes[2].plot(times, responses.mean(axis=0), color="#192f40", lw=2, label="Trial mean")
     local_roi = dataset.nrn_meta[roi_index]["roi_index"]
-    axes[2].set(ylabel="Gespeicherte Fluoreszenz", title=f"Zielwerte: lokale ROI {local_roi} (global {roi_index}), {len(responses)} Wiederholungen unverändert",
-                xlabel=f"Zeit (ms); Annahmen: {dt:g} ms/Frame, WAV-Start bei {offset_ms:g} ms")
-    axes[2].legend(frameon=False)
+    axes[2].set(ylabel="Stored fluorescence", title=f"C  Calcium response · ROI {local_roi} · {len(responses)} trials",
+                xlabel="Time from sound onset (ms)")
+    axes[2].axvspan(offset_ms, offset_ms + duration_ms, color="#d9c58c", alpha=0.3, zorder=0)
+    axes[2].legend(frameon=False, fontsize=8, ncol=2)
     for ax in axes[2:]:
         ax.axvline(0, ls="--", color="0.5", lw=0.8)
         ax.set_xlim(times[0] - dt, times[-1])
-    fig.suptitle(f"Site-Index {dataset.nrn_meta[roi_index]['site_index']} · globaler Stimulus {stimulus_index} ({meta['category']}) · echte Audiodaten")
+    fig.suptitle(f"Site {dataset.nrn_meta[roi_index]['site_index']} · Sound {stimulus_index} ({meta['category']})", fontsize=11)
+    for ax in axes:
+        ax.title.set_fontsize(10)
+        ax.xaxis.label.set_size(9)
+        ax.yaxis.label.set_size(9)
+        ax.tick_params(labelsize=8)
+    fig.supxlabel(f"Timing assumed: {dt:g} ms/frame; WAV onset {offset_ms:g} ms. Shading: audio duration.", fontsize=8)
     return fig
